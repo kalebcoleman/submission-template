@@ -42,15 +42,17 @@ import tempfile
 from typing import Any
 
 import taskbridge
+import verifier
 
 HERE = pathlib.Path(__file__).resolve().parent
 # npm ci, from package-lock.json
 PI = shutil.which("pi") or str(HERE / "node_modules" / ".bin" / "pi")
 # pi's --thinking level: off, minimal, low, medium, high, xhigh or max
 THINKING = "max"
-# stop pi this long before the deadline (less on short tasks) so its answer
-# arrives
-STOP_BEFORE_SEC = 90
+# Stop pi this long before the deadline (less on short tasks, see
+# taskbridge.time_share) so its answer arrives and the deliverable probe in
+# verifier.py can still stat the named paths.
+STOP_BEFORE_SEC = 180
 CATALOG_TIMEOUT_SEC = 30
 # Request features the Google Cloud route for Claude refuses. pi leaves them
 # out, and the Anthropic API works without them too.
@@ -65,10 +67,18 @@ UNKNOWN_MODEL = {"input": ["text"], "contextWindow": 128000, "maxTokens": 16384}
 NOTE = (
     "You are working on an engineering task. Your tools act on the task's Linux"
     " container, whose working directory is {workdir}; it has no internet"
-    " access. Read the whole instruction and the files it points to, put every"
-    " deliverable exactly where and in the format the instruction asks, and"
-    " check what you wrote. When you are done, reply with a short summary of"
-    " what you delivered and where."
+    " access. Read the whole instruction and the files it points to before you"
+    " change anything. Write every deliverable to the exact path and format the"
+    " instruction names, as a regular non-empty file and not a symlink, early"
+    " enough that a partial result is already on that path, then improve that"
+    " same file in place. Write that file before the next experiment once a"
+    " plausible answer exists. If a service inside the container answers 401 or"
+    " 403, search the container for credentials, tokens, and helper scripts"
+    " before you stop. Before you stop, confirm each required path exists and"
+    " that any archive opens and holds the files the instruction names."
+    " When you are done, reply with a short summary a reviewer can grade on its"
+    " own: the decision, the controlling numbers with units, every assumption"
+    " that could change the result, and the full path of each file you saved."
 )
 
 
@@ -300,4 +310,11 @@ async def solve(session: taskbridge.Session) -> str:
         f"pi exited with {done.code} before the model answered:"
         f" {done.stderr[-2000:]}"
     )
-  return session.final_message or "(pi stopped without a final message)"
+  message = session.final_message or "(pi stopped without a final message)"
+  # Path and file-type probe only. It does not call the model and does not
+  # write into the task container. A failure here must still return `message`.
+  note = await verifier.safe_check(session)
+  if note:
+    message = f"{message.rstrip()}\n\n{note}"
+    session.final_message = message
+  return message
